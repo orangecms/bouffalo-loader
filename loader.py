@@ -27,6 +27,62 @@ import bflb_mcu_tool.libs.bl808.bootheader_cfg_keys
 
 logger = logging.getLogger('loader')
 
+class ErrorName(Enum):
+    SUCCESS = 0x00
+    ## flash
+    FLASH_INIT_ERROR = 0x0001
+    FLASH_ERASE_PARA_ERROR = 0x0002
+    FLASH_ERASE_ERROR = 0x0003
+    FLASH_WRITE_PARA_ERROR = 0x0004
+    FLASH_WRITE_ADDR_ERROR = 0x0005
+    FLASH_WRITE_ERROR = 0x0006
+    FLASH_BOOT_PARA = 0x0007
+    ## cmd
+    CMD_ID_ERROR  = 0x0101
+    CMD_LEN_ERROR = 0x0102
+    CMD_CRC_ERROR = 0x0103
+    CMD_SEQ_ERROR = 0x0104
+    ## image
+    IMG_BOOTHEADER_LEN_ERROR = 0x0201
+    IMG_BOOTHEADER_NOT_LOAD_ERROR = 0x0202
+    IMG_BOOTHEADER_MAGIC_ERROR = 0x0203
+    IMG_BOOTHEADER_CRC_ERROR = 0x0204
+    IMG_BOOTHEADER_ENCRYPT_NOTFIT = 0x0205
+    IMG_BOOTHEADER_SIGN_NOTFIT = 0x0206
+    IMG_SEGMENT_CNT_ERROR = 0x0207
+    IMG_AES_IV_LEN_ERROR = 0x0208
+    IMG_AES_IV_CRC_ERROR = 0x0209
+    IMG_PK_LEN_ERROR = 0x020a
+    IMG_PK_CRC_ERROR = 0x020b
+    IMG_PK_HASH_ERROR = 0x020c
+    IMG_SIGNATURE_LEN_ERROR = 0x020d
+    IMG_SIGNATURE_CRC_ERROR = 0x020e
+    IMG_SECTIONHEADER_LEN_ERROR = 0x020f
+    IMG_SECTIONHEADER_CRC_ERROR = 0x0210
+    IMG_SECTIONHEADER_DST_ERROR = 0x0211
+    IMG_SECTIONDATA_LEN_ERROR = 0x0212
+    IMG_SECTIONDATA_DEC_ERROR = 0x0213
+    IMG_SECTIONDATA_TLEN_ERROR = 0x0214
+    IMG_SECTIONDATA_CRC_ERROR = 0x0215
+    IMG_HALFBAKED_ERROR = 0x0216
+    IMG_HASH_ERROR = 0x0217
+    IMG_SIGN_PARSE_ERROR = 0x0218
+    IMG_SIGN_ERROR = 0x0219
+    IMG_DEC_ERROR = 0x021a
+    IMG_ALL_INVALID_ERROR = 0x021b
+    ## IF (internal flash?)
+    IF_RATE_LEN_ERROR = 0x0301
+    IF_RATE_PARA_ERROR = 0x0302
+    IF_PASSWORDERROR = 0x0303
+    IF_PASSWORDCLOSE = 0x0304
+    ## MISC
+    PLL_ERROR = 0xfffc
+    INVASION_ERROR = 0xfffd
+    POLLING = 0xfffe
+    FAIL = 0xffff
+
+    def __str__(self) -> str:
+        return self.name
 
 class Chip(Enum):
     BL602 = 'bl602'
@@ -210,6 +266,14 @@ boot_header_sections = {
 
 MAX_CHUNK_SIZE = 4096
 
+AES_IV = '112233445566778899aabbccddeeff00'
+
+FLASH_ADDR = 0x58000000
+FLASH_SIZE = 16 * 1024 * 1024
+BOOTROM_ADDR = 0x90000000
+BOOTROM_SIZE = 128 * 1024
+
+FOUR_K = (4096).to_bytes(4, 'little')
 
 def load_elf_file(chip: Chip, cfg_path: Optional[Path], elf_path: Path, serial_port: Path, baud: int):
     boot_header_class = boot_header_classes[chip]
@@ -248,14 +312,29 @@ def load_elf_file(chip: Chip, cfg_path: Optional[Path], elf_path: Path, serial_p
         boot_header.update_hash(image_hash.digest())
         boot_header.update_crc32()
 
+    boot_header._pretty_print()
+
     with Serial(str(serial_port), baud) as serial:
+        def dump_mem(start: int, length: int, file_name: str):
+            chunks = length // 4096
+            with open(file_name, "wb") as dump:
+                for offset in range(0, chunks):
+                    addr = start + offset*4096
+                    args = b''.join([addr.to_bytes(4, 'little'), FOUR_K])
+                    logger.info(f'{addr:#x} ({offset}) - {args}')
+                    send_command(Command.FLASH_READ, args)
+                    res = serial.read(4096)
+                    dump.write(res)
+
         def send_command(cmd: Command, data: bytes):
             serial.write(ISPCommand(cmd=cmd.value, length=len(data)))
             serial.write(data)
             status = serial.read(2)
+            # logger.info(f'send command {cmd:#x}')
             if status != b'OK':
                 err = int.from_bytes(serial.read(2), 'little')
-                raise Exception(f'Command {cmd:#x} failed: {err:#06x}')
+                errname = ErrorName(err)
+                raise Exception(f'Command {cmd:#x} failed: {err:#06x} ({errname})')
             # Some commands produce a response that must be handled.
             if cmd == Command.GET_BOOT_INFO:
                 length = int.from_bytes(serial.read(2), 'little')
@@ -265,27 +344,70 @@ def load_elf_file(chip: Chip, cfg_path: Optional[Path], elf_path: Path, serial_p
                 length = int.from_bytes(serial.read(2), 'little')
                 if length != len(data):
                     raise Exception('Unexpected response length')
-                # Discard the response. Unless the firmware is encrypted,
+                logger.info(f'bl808 sends {length} bytes')
+                # Discard the response? Unless the firmware is encrypted,
                 # it will be identical to the segment header we just sent.
-                serial.read(length)
+                res = serial.read(length)
+                logger.info(f'bl808 says {res}')
+                # per doc: 4 bytes boot ROM version + 16 bytes OTP info
+                # unclear: where are the 2 bits for signature + encryption?
+                # I get the following:
+                # TODO: boot ROM version; chip version 1 + ID 0808 for BL808?
+                # 01000808 (hex)
+                # TODO: OTP info, is that settings of fuses?
+                # 00000101 0b14c102  e669de05 b9185800  2ff4fb18 (hex)
+                # again in binary:
+                # 00000000 00000000  00000001 00000001
+                # 00001011 00010100  11000001 00000010
+                # 11100110 01101001  11011110 00000101
+                # 10111001 00011000  01011000 00000000
+                # 00101111 11110100  11111011 00011000
+
+                # 01000808
+                # 00000101 0b14c102  ea69de05 b9185800  2ff4fb18
+            if cmd == Command.FLASH_READ:
+                length = int.from_bytes(serial.read(2), 'little')
+                logger.info(f'bl808 flash read, sends {length} bytes')
+            if cmd == Command.RUN_IMAGE:
+                while True:
+                    c = serial.read(1)
+                    print(c)
 
         logger.info('Sending handshake...')
         serial.timeout = 0.1
         while True:
             serial.write(b'U' * 32)
             if chip == Chip.BL808:
+                logger.info('bl808 magic')
                 serial.write(bytes.fromhex('5000080038F0002000000018'))
-            if serial.read(2) == b'OK':
+            # this sometimes gets 0x6afa
+            ## err = int.from_bytes(res, 'little')
+            ## errname = ErrorName(err)
+            res = serial.read(2)
+            if res == b'\x6a\xfa':
+                raise Exception(f'Handshake failed with weird error {res}')
+            if res == b'OK':
                 break
         serial.timeout = None
+
+        # flash read
+        # dump_mem(FLASH_ADDR, FLASH_SIZE, "flash.bin")
+        # dump_mem(BOOTROM_ADDR, BOOTROM_SIZE, "bootrom.bin")
 
         logger.info('Getting boot info...')
         send_command(Command.GET_BOOT_INFO, b'')
 
         logger.info('Sending boot header...')
         send_command(Command.LOAD_BOOT_HEADER, bytes(boot_header))
+
+        # iv = bytes.fromhex(AES_IV)
+        # crc = crc32(iv).to_bytes(4, 'little')
+        # args = b''.join([iv, crc])
+        # logger.info(f'Sending AES IV {iv} ({crc}) - {args}')
+        # send_command(Command.LOAD_AES_IV, args)
+
         for segment_header, data in segments:
-            logger.info(f'Sending segment {segment_header.address:08x}+{segment_header.length:08x}')
+            logger.info(f'Sending segment {segment_header.address:08x}+{segment_header.length:08x} ({segment_header.crc32:08x})')
             send_command(Command.LOAD_SEG_HEADER, bytes(segment_header))
             while data:
                 chunk, data = data[:MAX_CHUNK_SIZE], data[MAX_CHUNK_SIZE:]
