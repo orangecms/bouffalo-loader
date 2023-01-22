@@ -275,7 +275,8 @@ BOOTROM_SIZE = 128 * 1024
 
 FOUR_K = (4096).to_bytes(4, 'little')
 
-def load_elf_file(chip: Chip, cfg_path: Optional[Path], elf_path: Path, serial_port: Path, baud: int):
+
+def load_elf_file(chip: Chip, cfg_path: Optional[Path], elf_path: Path, elf_path2: Path, serial_port: Path, baud: int):
     boot_header_class = boot_header_classes[chip]
     if cfg_path:
         cfg_section = boot_header_sections[chip]
@@ -283,36 +284,52 @@ def load_elf_file(chip: Chip, cfg_path: Optional[Path], elf_path: Path, serial_p
     else:
         boot_header = boot_header_class()
 
+    segments = []
     # Extract the segments from the ELF file.
     with ELFFile(elf_path.open('rb')) as elf_file:
-        segments = []
         for elf_segment in elf_file.iter_segments():
             # Skip non-loadable segments.
             if elf_segment.header.p_filesz == 0 or \
                elf_segment.header.p_type != 'PT_LOAD':
                 continue
+
+            logger.info(f'ELF1 segment ({elf_segment.header.p_type}) @ {elf_segment.header.p_paddr:08x}')
             segments.append((
                 SegmentHeader.from_elf_segment(elf_segment),
                 elf_segment.data(),
             ))
 
-        # Generate the SHA-256 hash for the entire loaded image.
-        image_hash = sha256()
-        for segment_header, data in segments:
-            image_hash.update(segment_header)
-            image_hash.update(data)
+    if elf_path2 is not None:
+        with ELFFile(elf_path2.open('rb')) as elf_file2:
+            for elf_segment in elf_file2.iter_segments():
+                # Skip non-loadable segments.
+                if elf_segment.header.p_filesz == 0 or \
+                   elf_segment.header.p_type != 'PT_LOAD':
+                    continue
+                logger.info(f'ELF2 segment ({elf_segment.header.p_type}) @ {elf_segment.header.p_paddr:08x}')
+                segments.append((
+                    SegmentHeader.from_elf_segment(elf_segment),
+                    elf_segment.data(),
+                ))
 
-        # Update the boot header from the ELF file.
-        if chip == Chip.BL808:
-            boot_header.img_len_cnt = len(segments)
-            boot_header.m0_boot_entry = elf_file.header.e_entry
-        else:
-            boot_header.img_len = len(segments)
-            boot_header.img_start = elf_file.header.e_entry
-        boot_header.update_hash(image_hash.digest())
-        boot_header.update_crc32()
+    # Generate the SHA-256 hash for the entire loaded image.
+    image_hash = sha256()
+    for segment_header, data in segments:
+        image_hash.update(segment_header)
+        image_hash.update(data)
 
-    boot_header._pretty_print()
+    # Update the boot header from the ELF file.
+    if chip == Chip.BL808:
+        boot_header.img_len_cnt = len(segments)
+        logger.info(f'Entry point {elf_file.header.e_entry:08x}')
+        boot_header.m0_boot_entry = elf_file.header.e_entry
+    else:
+        boot_header.img_len = len(segments)
+        boot_header.img_start = elf_file.header.e_entry
+    boot_header.update_hash(image_hash.digest())
+    boot_header.update_crc32()
+
+    # boot_header._pretty_print()
 
     with Serial(str(serial_port), baud) as serial:
         def dump_mem(start: int, length: int, file_name: str):
@@ -436,13 +453,16 @@ def main():
                         help='Serial port device path',
                         default=Path('/dev/ttyS0'), type=Path)
     parser.add_argument('firmware',
-                        help='ELF executable file path',
+                        help='ELF executable file path for C906 core',
+                        type=Path)
+    parser.add_argument('firmware2',
+                        help='ELF executable file path for E907 core',
                         type=Path)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG)
     try:
-        load_elf_file(args.chip, args.cfg, args.firmware, args.port, args.baud)
+        load_elf_file(args.chip, args.cfg, args.firmware, args.firmware2, args.port, args.baud)
     except Exception as e:
         logger.exception('Failed to communicate with the MCU')
 
